@@ -1,0 +1,15 @@
+name = "neon-flow"
+main = "index.js"
+compatibility_date = "2024-01-01"
+
+# 环境变量（在 Cloudflare Dashboard 中配置）
+# GROQ_API_KEY: Groq API 密钥
+# CF_ACCOUNT_ID: Cloudflare Account ID
+# CF_API_TOKEN: Cloudflare API Token
+
+[vars]
+STATE = "alive"
+
+# 触发器：每5分钟执行健康检查
+[triggers]
+crons = ["*/5 * * * *"]
