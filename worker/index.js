@@ -10,7 +10,7 @@ const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
 const GROQ_MODEL = 'llama-3.3-70b-versatile'
 
 const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions'
-const OPENROUTER_MODEL = 'meta-llama/llama-3.3-70b-instruct'
+const OPENROUTER_MODEL = 'minimax/minimax-m2.5:free'
 
 const CF_MODEL = '@cf/meta/llama-3.1-8b-instruct'
 const REQUEST_TIMEOUT = 15000
