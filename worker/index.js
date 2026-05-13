@@ -1,16 +1,29 @@
 /**
- * NEON-FLOW Worker v3.0
+ * NEON-FLOW Worker v4.0
  * 流光 - 去中心化 AI 助手
  * 
- * 架构: GitHub Pages (前端) → Cloudflare Worker (网关) → Groq/Llama3 (模型)
- * 路由: Groq(主,免费) → OpenRouter(备用,付费) → CF Workers AI(最后备用)
+ * 架构: GitHub Pages (前端) → Cloudflare Worker (网关) → 多模型路由
+ * 路由: Groq(主) → OpenRouter免费模型(备用) → CF Workers AI(最后备用)
+ * 
+ * OpenRouter免费模型池 (按优先级):
+ * 1. qwen/qwen3-next-80b-a3b-instruct:free  (实测可用)
+ * 2. nvidia/nemotron-3-super-120b-a12b:free  (实测可用)
+ * 3. openai/gpt-oss-120b:free              (实测可用)
+ * 4. minimax/minimax-m2.5:free            (实测可用)
+ * 5. meta-llama/llama-3.3-70b-instruct:free (实测限速)
  */
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
 const GROQ_MODEL = 'llama-3.3-70b-versatile'
 
 const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions'
-const OPENROUTER_MODEL = 'minimax/minimax-m2.5:free'
+const OPENROUTER_FREE_MODELS = [
+  'qwen/qwen3-next-80b-a3b-instruct:free',
+  'nvidia/nemotron-3-super-120b-a12b:free',
+  'openai/gpt-oss-120b:free',
+  'minimax/minimax-m2.5:free',
+]
+let currentModelIndex = 0
 
 const CF_MODEL = '@cf/meta/llama-3.1-8b-instruct'
 const REQUEST_TIMEOUT = 15000
@@ -77,7 +90,7 @@ export default {
 
     if (url.pathname === '/' || url.pathname === '') {
       return jsonResponse({
-        name: 'NEON-FLOW', version: '3.0', status: currentState,
+        name: 'NEON-FLOW', version: '4.0', status: currentState,
         endpoints: { chat: '/api/chat', health: '/health', models: '/models' }
       })
     }
@@ -85,16 +98,21 @@ export default {
     if (url.pathname === '/health') {
       return jsonResponse({
         status: currentState,
-        primary: primaryServiceHealthy ? 'groq' : 'fallback',
+        primary: primaryServiceHealthy ? 'groq' : 'openrouter',
+        currentModel: OPENROUTER_FREE_MODELS[currentModelIndex],
         timestamp: Date.now()
       })
     }
 
     if (url.pathname === '/models') {
       return jsonResponse({
-        primary: { provider: 'Groq', model: GROQ_MODEL, status: primaryServiceHealthy ? 'available' : 'unavailable' },
-        fallback: { provider: 'OpenRouter', model: OPENROUTER_MODEL },
-        lastResort: { provider: 'CF Workers AI', model: CF_MODEL }
+        groq: { provider: 'Groq', model: GROQ_MODEL, status: primaryServiceHealthy ? 'available' : 'unavailable' },
+        openrouter: {
+          provider: 'OpenRouter',
+          models: OPENROUTER_FREE_MODELS,
+          current: OPENROUTER_FREE_MODELS[currentModelIndex]
+        },
+        cf: { provider: 'CF Workers AI', model: CF_MODEL }
       })
     }
 
@@ -117,7 +135,7 @@ export default {
       if (primaryServiceHealthy) {
         return await handleGroq(chatMessages, reqId, env)
       } else {
-        return await handleFallback(chatMessages, reqId, env)
+        return await handleOpenRouterFallback(chatMessages, reqId, env)
       }
     }
 
@@ -129,13 +147,12 @@ export default {
   }
 }
 
-// Groq 主用 (免费 500k tokens/天)
+// Groq 主用
 async function handleGroq(messages, reqId, env) {
-  const GROQ_API_KEY = env.GROQ_API_KEY
+  const { GROQ_API_KEY } = env
   if (!GROQ_API_KEY) {
-    console.error(`[${reqId}] Groq key not configured`)
     primaryServiceHealthy = false
-    return await handleFallback(messages, reqId, env)
+    return await handleOpenRouterFallback(messages, reqId, env)
   }
 
   try {
@@ -154,20 +171,15 @@ async function handleGroq(messages, reqId, env) {
     })
 
     if (response.status === 429) {
-      console.warn(`[${reqId}] Groq rate limited`)
       primaryServiceHealthy = false
-      return await handleFallback(messages, reqId, env)
+      return await handleOpenRouterFallback(messages, reqId, env)
     }
 
     const data = await response.json()
-
-    if (!response.ok) {
-      throw new Error(data.error?.message || `HTTP ${response.status}`)
-    }
+    if (!response.ok) throw new Error(data.error?.message || `HTTP ${response.status}`)
 
     currentState = STATE.ALIVE
     primaryServiceHealthy = true
-
     return jsonResponse({
       content: data.choices[0].message.content,
       model: GROQ_MODEL,
@@ -177,16 +189,21 @@ async function handleGroq(messages, reqId, env) {
   } catch (error) {
     console.error(`[${reqId}] Groq failed:`, error.message)
     primaryServiceHealthy = false
-    return await handleFallback(messages, reqId, env)
+    return await handleOpenRouterFallback(messages, reqId, env)
   }
 }
 
-// 备用链路: OpenRouter → CF Workers AI
-async function handleFallback(messages, reqId, env) {
+// OpenRouter 免费模型池轮询
+async function handleOpenRouterFallback(messages, reqId, env) {
   const { OPENROUTER_API_KEY, CF_ACCOUNT_ID, CF_API_TOKEN } = env
 
-  // 先试 OpenRouter
-  if (OPENROUTER_API_KEY) {
+  if (!OPENROUTER_API_KEY) {
+    return await handleCFFallback(messages, reqId, CF_ACCOUNT_ID, CF_API_TOKEN)
+  }
+
+  // 依次尝试各免费模型
+  for (let i = 0; i < OPENROUTER_FREE_MODELS.length; i++) {
+    const model = OPENROUTER_FREE_MODELS[i]
     try {
       const response = await fetchWithTimeout(OPENROUTER_API_URL, {
         method: 'POST',
@@ -197,99 +214,150 @@ async function handleFallback(messages, reqId, env) {
           'X-Title': 'NEON-FLOW'
         },
         body: JSON.stringify({
-          model: OPENROUTER_MODEL,
+          model,
           messages,
           temperature: 0.7,
           max_tokens: 1024
         })
       })
 
-      if (response.ok) {
-        const data = await response.json()
-        currentState = STATE.DEGRADED
-        return jsonResponse({
-          content: data.choices[0].message.content,
-          model: OPENROUTER_MODEL,
-          fallback: true,
-          requestId: reqId
-        })
+      if (response.status === 429 || response.status === 503) {
+        // 被限速，尝试下一个模型
+        console.warn(`[${reqId}] ${model} rate-limited, trying next`)
+        currentModelIndex = (currentModelIndex + 1) % OPENROUTER_FREE_MODELS.length
+        continue
       }
-    } catch (e) {
-      console.error(`[${reqId}] OpenRouter fallback error:`, e.message)
+
+      const data = await response.json()
+      if (!response.ok) {
+        console.error(`[${reqId}] ${model} error:`, data.error?.message)
+        currentModelIndex = (currentModelIndex + 1) % OPENROUTER_FREE_MODELS.length
+        continue
+      }
+
+      // 成功
+      currentModelIndex = OPENROUTER_FREE_MODELS.indexOf(model)
+      currentState = STATE.DEGRADED
+      return jsonResponse({
+        content: data.choices[0].message.content,
+        model,
+        fallback: true,
+        requestId: reqId
+      })
+    } catch (error) {
+      console.error(`[${reqId}] ${model} failed:`, error.message)
+      currentModelIndex = (currentModelIndex + 1) % OPENROUTER_FREE_MODELS.length
+      continue
     }
   }
 
-  // 再试 CF Workers AI
-  if (CF_ACCOUNT_ID && CF_API_TOKEN) {
-    try {
-      const response = await fetchWithTimeout(
-        `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CF_MODEL}`,
-        {
-          method: 'POST',
-          headers: { 'Authorization': `Bearer ${CF_API_TOKEN}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ messages, max_tokens: 1024, temperature: 0.7 })
-        }
-      )
+  // 所有 OpenRouter 模型都失败，尝试 CF
+  return await handleCFFallback(messages, reqId, CF_ACCOUNT_ID, CF_API_TOKEN)
+}
 
-      if (response.ok) {
-        const data = await response.json()
-        currentState = STATE.DEGRADED
-        return jsonResponse({
-          content: data.result.response,
-          model: CF_MODEL,
-          fallback: true,
-          requestId: reqId
-        })
+// CF Workers AI 最后备用
+async function handleCFFallback(messages, reqId, CF_ACCOUNT_ID, CF_API_TOKEN) {
+  if (!CF_ACCOUNT_ID || !CF_API_TOKEN) {
+    currentState = STATE.DEAD
+    return jsonResponse({
+      error: '所有服务商均不可用',
+      content: '抱歉，当前流光暂时无法提供服务。请稍后再试。'
+    }, 503)
+  }
+
+  try {
+    const response = await fetchWithTimeout(
+      `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/ai/run/${CF_MODEL}`,
+      {
+        method: 'POST',
+        headers: { 'Authorization': `Bearer ${CF_API_TOKEN}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ messages, max_tokens: 1024, temperature: 0.7 })
       }
-    } catch (e) {
-      console.error(`[${reqId}] CF Workers fallback error:`, e.message)
+    )
+
+    if (!response.ok) throw new Error('CF Workers AI 请求失败')
+
+    const data = await response.json()
+    currentState = STATE.DEGRADED
+    return jsonResponse({
+      content: data.result.response,
+      model: CF_MODEL,
+      fallback: true,
+      requestId: reqId
+    })
+  } catch (error) {
+    console.error(`[${reqId}] CF Workers failed:`, error.message)
+    currentState = STATE.DEAD
+    return jsonResponse({
+      error: '所有服务商均不可用',
+      content: '抱歉，当前流光暂时无法提供服务。请稍后再试。'
+    }, 503)
+  }
+}
+
+// 健康检查：检测 Groq，如果 Groq 不可用则轮询 OpenRouter 模型
+async function checkHealth(env) {
+  const { GROQ_API_KEY } = env
+
+  if (GROQ_API_KEY) {
+    try {
+      const response = await fetchWithTimeout(GROQ_API_URL, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${GROQ_API_KEY}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          model: GROQ_MODEL,
+          messages: [{ role: 'user', content: 'ping' }],
+          max_tokens: 1
+        })
+      }, 10000)
+
+      if (response.ok || response.status === 429) {
+        primaryServiceHealthy = true
+        currentState = STATE.ALIVE
+        console.log('Health: Groq OK')
+        return
+      }
+    } catch (error) {
+      console.error('Health: Groq failed:', error.message)
+    }
+  }
+
+  // Groq 不可用，检测 OpenRouter 免费模型池
+  primaryServiceHealthy = false
+  const { OPENROUTER_API_KEY } = env
+
+  for (let i = 0; i < OPENROUTER_FREE_MODELS.length; i++) {
+    const model = OPENROUTER_FREE_MODELS[i]
+    try {
+      const response = await fetchWithTimeout(OPENROUTER_API_URL, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${OPENROUTER_API_KEY || ''}`,
+          'Content-Type': 'application/json',
+          'HTTP-Referer': 'https://dwlab.asia',
+          'X-Title': 'NEON-FLOW'
+        },
+        body: JSON.stringify({
+          model,
+          messages: [{ role: 'user', content: 'ping' }],
+          max_tokens: 1
+        })
+      }, 10000)
+
+      if (response.ok || response.status === 429) {
+        currentModelIndex = i
+        currentState = STATE.DEGRADED
+        console.log(`Health: OpenRouter OK (${model})`)
+        return
+      }
+    } catch (error) {
+      console.error(`Health: ${model} failed:`, error.message)
     }
   }
 
   currentState = STATE.DEAD
-  return jsonResponse({
-    error: '所有服务商均不可用',
-    content: '抱歉，当前流光暂时无法提供服务。请稍后再试。'
-  }, 503)
-}
-
-// 健康检查
-async function checkHealth(env) {
-  const { GROQ_API_KEY } = env
-
-  if (!GROQ_API_KEY) {
-    primaryServiceHealthy = false
-    currentState = STATE.DEAD
-    console.log('Health: Groq key missing')
-    return
-  }
-
-  try {
-    const response = await fetchWithTimeout(GROQ_API_URL, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${GROQ_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: GROQ_MODEL,
-        messages: [{ role: 'user', content: 'ping' }],
-        max_tokens: 1
-      })
-    }, 10000)
-
-    if (response.ok || response.status === 429) {
-      primaryServiceHealthy = true
-      currentState = STATE.ALIVE
-      console.log('Health: Groq OK')
-    } else {
-      primaryServiceHealthy = false
-      currentState = STATE.DEGRADED
-      console.log('Health: Groq down')
-    }
-  } catch (error) {
-    primaryServiceHealthy = false
-    currentState = STATE.DEGRADED
-    console.error('Health check failed:', error.message)
-  }
+  console.log('Health: All services down')
 }
