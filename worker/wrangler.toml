@@ -2,6 +2,10 @@ name = "neon-flow"
 main = "index.js"
 compatibility_date = "2024-01-01"
 
+kv_namespaces = [
+  { binding = "CHAT_HISTORY", id = "e9fc4e8805764cb088e58da920a51f0b" }
+]
+
 # 环境变量（在 Cloudflare Dashboard 配置）
 # GROQ_API_KEY: Groq API 密钥（主用，免费500k/天）
 # OPENROUTER_API_KEY: OpenRouter API 密钥（备用）
