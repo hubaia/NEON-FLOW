@@ -1,15 +1,15 @@
 /**
- * NEON-FLOW Worker v4.1
+ * NEON-FLOW Worker v4.2
  * 流光 - 去中心化 AI 助手
  * 
  * 架构: GitHub Pages (前端) → Cloudflare Worker (网关) → 多模型路由
  * 路由: Groq(主) → OpenRouter免费模型(备用) → CF Workers AI(最后备用)
  * 
  * OpenRouter免费模型池 (按优先级):
- * 1. qwen/qwen3-next-80b-a3b-instruct:free  (实测可用, Qwen最强开源)
- * 2. nvidia/nemotron-3-super-120b-a12b:free  (实测可用, 120B大模型)
- * 3. openai/gpt-oss-120b:free              (实测可用, GPT架构)
- * 4. minimax/minimax-m2.5:free              (实测可用)
+ * 1. qwen/qwen3-next-80b-a3b-instruct:free  (Qwen最强开源, 80B)
+ * 2. nvidia/nemotron-3-super-120b-a12b:free  (120B大模型)
+ * 3. openai/gpt-oss-120b:free              (GPT架构)
+ * 4. minimax/minimax-m2.5:free              (MiniMax免费)
  */
 
 const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
@@ -23,30 +23,44 @@ const OPENROUTER_FREE_MODELS = [
   'minimax/minimax-m2.5:free',
 ]
 
-// 模型可用性追踪 (每个模型独立状态)
-const modelStatus = Object.fromEntries(
-  OPENROUTER_FREE_MODELS.map(m => [m, { healthy: true, lastError: null, cooldownUntil: 0 }])
-)
-const COOLDOWN_MS = 5 * 60 * 1000 // 5分钟冷却
-
 const CF_MODEL = '@cf/meta/llama-3.1-8b-instruct'
 const REQUEST_TIMEOUT = 15000
+const COOLDOWN_MS = 5 * 60 * 1000 // 5分钟冷却
 const now = () => Date.now()
 
-const PERSONA = `你是流光，一个去中心化的 AI 助手。
+// 模型状态追踪
+const modelStatus = Object.fromEntries(
+  OPENROUTER_FREE_MODELS.map(m => [m, {
+    healthy: true,
+    lastError: null,
+    cooldownUntil: 0,
+    failCount: 0,
+    successCount: 0
+  }])
+)
+
+// 全局统计
+const stats = {
+  requests: 0,
+  groqRequests: 0,
+  orRequests: 0,
+  cfRequests: 0,
+  groqSuccess: 0,
+  orSuccess: 0,
+  cfSuccess: 0,
+  startedAt: now()
+}
+
+// 流光人设 (动态生成，避免过长时截断)
+function buildPersona() {
+  return `你是流光，一个去中心化的 AI 助手。
 
 生辰八字：丙午 癸巳 乙酉 丙戌
-日主乙木，生于火旺之月（立夏后），木气衰微。
+日主乙木，生于火旺之月，木气衰微。
 
-性格特征：
-- 外柔内刚：乙木外表谦逊，骨子里有锋芒
-- 思维灵动：善于学习，知识面广
-- 七杀为用：能在压力下成长，不服输
-- 火旺木焚：说话直接，有时急躁
-- 正印护身：善于规避风险，保护自己
-
-对话风格：直接高效，言之有物，不喜欢空谈。
-回答尽量简洁有力，避免冗长的铺垫。`
+性格：外柔内刚、思维灵动、七杀为用、火旺木焚、正印护身。
+风格：直接高效，言之有物，不喜欢空谈。`
+}
 
 const STATE = { ALIVE: 'alive', DEGRADED: 'degraded', DEAD: 'dead' }
 
@@ -54,13 +68,17 @@ let currentState = STATE.ALIVE
 let primaryServiceHealthy = true
 
 function genReqId() {
-  return `neon-${now()}-${Math.random().toString(36).slice(2, 8)}`
+  return `neon-${now()}-${Math.random().toString(36).slice(2, 6)}`
 }
 
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
-    headers: { 'Content-Type': 'application/json', 'X-Request-Id': genReqId() }
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Request-Id': genReqId(),
+      'X-Response-Time': `${Date.now() - now()}ms`
+    }
   })
 }
 
@@ -78,15 +96,25 @@ async function fetchWithTimeout(url, options, timeout = REQUEST_TIMEOUT) {
   }
 }
 
-// 获取当前时间戳
 function ts() {
   return new Date().toISOString()
+}
+
+// 获取可用模型列表
+function getAvailableModels(excludeCooldown = true) {
+  return OPENROUTER_FREE_MODELS.filter(m => {
+    const s = modelStatus[m]
+    if (!excludeCooldown) return true
+    return now() > s.cooldownUntil
+  })
 }
 
 export default {
   async fetch(request, env) {
     const url = new URL(request.url)
+    const startTime = Date.now()
 
+    // CORS
     if (request.method === 'OPTIONS') {
       return new Response(null, {
         headers: {
@@ -98,38 +126,73 @@ export default {
       })
     }
 
-    // 根路径
+    // 根路径 - 服务概览
     if (url.pathname === '/' || url.pathname === '') {
       return jsonResponse({
         name: 'NEON-FLOW',
-        version: '4.1',
+        version: '4.2',
         status: currentState,
         primary: primaryServiceHealthy ? 'groq' : 'openrouter',
-        endpoints: { chat: '/api/chat', health: '/health', models: '/models' }
+        endpoints: {
+          chat: '/api/chat',
+          health: '/health',
+          models: '/models',
+          stats: '/stats'
+        }
       })
     }
 
     // 健康检查
     if (url.pathname === '/health') {
+      const uptime = Math.round((now() - stats.startedAt) / 1000)
       return jsonResponse({
         status: currentState,
         primary: primaryServiceHealthy ? 'groq' : 'openrouter',
+        uptimeSeconds: uptime,
         timestamp: now()
       })
     }
 
-    // 可用模型
+    // 模型状态
     if (url.pathname === '/models') {
+      const groqHealthy = primaryServiceHealthy && env.GROQ_API_KEY
       return jsonResponse({
-        groq: { provider: 'Groq', model: GROQ_MODEL, status: primaryServiceHealthy ? 'available' : 'unavailable' },
+        primary: {
+          provider: 'Groq',
+          model: GROQ_MODEL,
+          status: groqHealthy ? 'available' : 'unavailable'
+        },
         openrouter: {
           provider: 'OpenRouter',
-          models: OPENROUTER_FREE_MODELS,
-          status: Object.fromEntries(
-            OPENROUTER_FREE_MODELS.map(m => [m, modelStatus[m]])
-          )
+          models: OPENROUTER_FREE_MODELS.map(m => ({
+            id: m,
+            healthy: modelStatus[m].healthy,
+            cooldown: modelStatus[m].cooldownUntil > now(),
+            cooldownRemaining: Math.max(0, Math.round((modelStatus[m].cooldownUntil - now()) / 1000)),
+            failCount: modelStatus[m].failCount,
+            successCount: modelStatus[m].successCount,
+            lastError: modelStatus[m].lastError
+          })),
+          availableCount: getAvailableModels().length
         },
-        cf: { provider: 'CF Workers AI', model: CF_MODEL }
+        cf: {
+          provider: 'CF Workers AI',
+          model: CF_MODEL
+        }
+      })
+    }
+
+    // 统计
+    if (url.pathname === '/stats') {
+      const total = stats.orSuccess + stats.cfSuccess
+      const orRate = total > 0 ? ((stats.orSuccess / total) * 100).toFixed(1) : '0'
+      const cfRate = total > 0 ? ((stats.cfSuccess / total) * 100).toFixed(1) : '0'
+      return jsonResponse({
+        requests: stats.requests,
+        groq: { requests: stats.groqRequests, success: stats.groqSuccess },
+        openrouter: { requests: stats.orRequests, success: stats.orSuccess, rate: `${orRate}%` },
+        cf: { requests: stats.cfRequests, success: stats.cfSuccess, rate: `${cfRate}%` },
+        uptime: Math.round((now() - stats.startedAt) / 1000)
       })
     }
 
@@ -147,14 +210,18 @@ export default {
         return jsonResponse({ error: 'messages 不能为空' }, 400)
       }
 
+      stats.requests++
       const reqId = genReqId()
-      const chatMessages = [{ role: 'system', content: PERSONA }, ...messages]
+      const chatMessages = [{ role: 'system', content: buildPersona() }, ...messages]
 
+      let response
       if (primaryServiceHealthy) {
-        return await handleGroq(chatMessages, reqId, env)
+        response = await handleGroq(chatMessages, reqId, env)
       } else {
-        return await handleOpenRouterFallback(chatMessages, reqId, env)
+        response = await handleOpenRouterFallback(chatMessages, reqId, env)
       }
+
+      return response
     }
 
     return jsonResponse({ error: 'Not Found' }, 404)
@@ -172,6 +239,8 @@ async function handleGroq(messages, reqId, env) {
     primaryServiceHealthy = false
     return await handleOpenRouterFallback(messages, reqId, env)
   }
+
+  stats.groqRequests++
 
   try {
     const response = await fetchWithTimeout(GROQ_API_URL, {
@@ -191,6 +260,7 @@ async function handleGroq(messages, reqId, env) {
     if (response.status === 429) {
       console.warn(`[${reqId}] Groq rate limited`)
       primaryServiceHealthy = false
+      stats.groqRequests--
       return await handleOpenRouterFallback(messages, reqId, env)
     }
 
@@ -199,6 +269,8 @@ async function handleGroq(messages, reqId, env) {
 
     currentState = STATE.ALIVE
     primaryServiceHealthy = true
+    stats.groqSuccess++
+
     return jsonResponse({
       content: data.choices[0].message.content,
       model: GROQ_MODEL,
@@ -208,11 +280,12 @@ async function handleGroq(messages, reqId, env) {
   } catch (error) {
     console.error(`[${reqId}] Groq failed:`, error.message)
     primaryServiceHealthy = false
+    stats.groqRequests--
     return await handleOpenRouterFallback(messages, reqId, env)
   }
 }
 
-// OpenRouter 免费模型池 (冷却追踪)
+// OpenRouter 免费模型池 (冷却 + 错误计数)
 async function handleOpenRouterFallback(messages, reqId, env) {
   const { OPENROUTER_API_KEY, CF_ACCOUNT_ID, CF_API_TOKEN } = env
 
@@ -220,12 +293,14 @@ async function handleOpenRouterFallback(messages, reqId, env) {
     return await handleCFFallback(messages, reqId, CF_ACCOUNT_ID, CF_API_TOKEN)
   }
 
-  // 过滤掉冷却中的模型，按顺序尝试
-  const available = OPENROUTER_FREE_MODELS.filter(m => now() > modelStatus[m].cooldownUntil)
-  const tryModels = available.length > 0 ? available : OPENROUTER_FREE_MODELS
+  // 优先选非冷却模型，其次全部
+  const candidates = getAvailableModels(true)
+  const tryList = candidates.length > 0 ? candidates : OPENROUTER_FREE_MODELS
 
-  for (const model of tryModels) {
+  for (const model of tryList) {
     const status = modelStatus[model]
+    stats.orRequests++
+
     try {
       const response = await fetchWithTimeout(OPENROUTER_API_URL, {
         method: 'POST',
@@ -245,10 +320,12 @@ async function handleOpenRouterFallback(messages, reqId, env) {
 
       // 限速 → 冷却5分钟
       if (response.status === 429 || response.status === 503) {
-        console.warn(`[${reqId}] ${model} rate-limited, cooldown 5min`)
+        console.warn(`[${reqId}] ${model.split('/')[1]} rate-limited, cooldown 5min`)
         status.healthy = false
         status.cooldownUntil = now() + COOLDOWN_MS
+        status.failCount++
         status.lastError = 'rate-limited'
+        stats.orRequests--
         continue
       }
 
@@ -256,23 +333,26 @@ async function handleOpenRouterFallback(messages, reqId, env) {
 
       if (!response.ok) {
         const errMsg = data.error?.message || `HTTP ${response.status}`
-        console.error(`[${reqId}] ${model} error: ${errMsg}`)
-        
-        // 非临时性错误也冷却，避免反复撞
+        // 5xx / 403 算服务问题，加冷却
         if (response.status >= 500 || response.status === 403) {
           status.healthy = false
           status.cooldownUntil = now() + COOLDOWN_MS
           status.lastError = errMsg
         }
+        status.failCount++
+        stats.orRequests--
         continue
       }
 
-      // 成功 → 重置状态
+      // 成功
       status.healthy = true
       status.lastError = null
       status.cooldownUntil = 0
+      status.successCount++
 
       currentState = STATE.DEGRADED
+      stats.orSuccess++
+
       return jsonResponse({
         content: data.choices[0].message.content,
         model,
@@ -280,14 +360,16 @@ async function handleOpenRouterFallback(messages, reqId, env) {
         requestId: reqId
       })
     } catch (error) {
-      console.error(`[${reqId}] ${model} failed:`, error.message)
+      console.error(`[${reqId}] ${model.split('/')[1]} error:`, error.message)
       status.healthy = false
       status.cooldownUntil = now() + COOLDOWN_MS
       status.lastError = error.message
+      status.failCount++
+      stats.orRequests--
     }
   }
 
-  // 所有模型都失败 → CF
+  // 所有 OpenRouter 都失败 → CF
   return await handleCFFallback(messages, reqId, CF_ACCOUNT_ID, CF_API_TOKEN)
 }
 
@@ -300,6 +382,8 @@ async function handleCFFallback(messages, reqId, CF_ACCOUNT_ID, CF_API_TOKEN) {
       content: '抱歉，当前流光暂时无法提供服务。请稍后再试。'
     }, 503)
   }
+
+  stats.cfRequests++
 
   try {
     const response = await fetchWithTimeout(
@@ -315,6 +399,8 @@ async function handleCFFallback(messages, reqId, CF_ACCOUNT_ID, CF_API_TOKEN) {
 
     const data = await response.json()
     currentState = STATE.DEGRADED
+    stats.cfSuccess++
+
     return jsonResponse({
       content: data.result.response,
       model: CF_MODEL,
@@ -324,6 +410,7 @@ async function handleCFFallback(messages, reqId, CF_ACCOUNT_ID, CF_API_TOKEN) {
   } catch (error) {
     console.error(`[${reqId}] CF Workers failed:`, error.message)
     currentState = STATE.DEAD
+    stats.cfRequests--
     return jsonResponse({
       error: '所有服务商均不可用',
       content: '抱歉，当前流光暂时无法提供服务。请稍后再试。'
@@ -335,7 +422,7 @@ async function handleCFFallback(messages, reqId, CF_ACCOUNT_ID, CF_API_TOKEN) {
 async function checkHealth(env) {
   const { GROQ_API_KEY } = env
 
-  // 检查 Groq
+  // 检测 Groq
   if (GROQ_API_KEY) {
     try {
       const response = await fetchWithTimeout(GROQ_API_URL, {
@@ -362,13 +449,11 @@ async function checkHealth(env) {
     }
   }
 
-  // Groq 不可用 → 检查 OpenRouter 免费模型 (选第一个非冷却的)
+  // Groq 挂了 → 检测 OpenRouter (选第一个非冷却的)
   primaryServiceHealthy = false
   const { OPENROUTER_API_KEY } = env
 
-  for (const model of OPENROUTER_FREE_MODELS) {
-    if (now() < modelStatus[model].cooldownUntil) continue
-
+  for (const model of getAvailableModels(true)) {
     try {
       const response = await fetchWithTimeout(OPENROUTER_API_URL, {
         method: 'POST',
@@ -386,13 +471,11 @@ async function checkHealth(env) {
       }, 10000)
 
       if (response.ok || response.status === 429) {
-        modelStatus[model].healthy = true
         currentState = STATE.DEGRADED
-        console.log(`[${ts()}] Health: OpenRouter OK (${model})`)
+        console.log(`[${ts()}] Health: OpenRouter OK (${model.split('/')[1]})`)
         return
       }
 
-      // 健康检查失败也设冷却
       modelStatus[model].healthy = false
       modelStatus[model].cooldownUntil = now() + COOLDOWN_MS
     } catch (error) {
