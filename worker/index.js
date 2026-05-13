@@ -2,7 +2,7 @@
  * NEON-FLOW Worker
  * 流光 - 去中心化 AI 助手
  * 
- * 架构: GitHub Pages (前端) → Cloudflare Worker (网关) → Groq/Llama3 (模型)
+ * 架构: GitHub Pages (前端) → Cloudflare Worker (网关) → OpenRouter/Llama3 (模型)
  * 健康检测: 自动切换到备用服务商
  */
 
@@ -38,7 +38,6 @@ const STATE = {
 
 let currentState = STATE.ALIVE
 let primaryServiceHealthy = true
-let groqRequestCount = 0
 
 export default {
   async fetch(request, env, ctx) {
@@ -60,7 +59,7 @@ export default {
     if (url.pathname === '/health') {
       return new Response(JSON.stringify({
         status: currentState,
-        service: primaryServiceHealthy ? 'groq' : 'cf-workers',
+        service: primaryServiceHealthy ? 'openrouter' : 'cf-workers',
         timestamp: Date.now()
       }), {
         headers: { 'Content-Type': 'application/json' }
