@@ -1,5 +1,5 @@
 /**
- * NEON-FLOW Worker
+ * NEON-FLOW Worker v3.0
  * 流光 - 去中心化 AI 助手
  * 
  * 架构: GitHub Pages (前端) → Cloudflare Worker (网关) → Groq/Llama3 (模型)
@@ -61,7 +61,7 @@ async function fetchWithTimeout(url, options, timeout = REQUEST_TIMEOUT) {
 }
 
 export default {
-  async fetch(request) {
+  async fetch(request, env) {
     const url = new URL(request.url)
 
     if (request.method === 'OPTIONS') {
@@ -115,9 +115,9 @@ export default {
       const chatMessages = [{ role: 'system', content: PERSONA }, ...messages]
 
       if (primaryServiceHealthy) {
-        return await handleGroq(chatMessages, reqId)
+        return await handleGroq(chatMessages, reqId, env)
       } else {
-        return await handleFallback(chatMessages, reqId)
+        return await handleFallback(chatMessages, reqId, env)
       }
     }
 
@@ -130,12 +130,12 @@ export default {
 }
 
 // Groq 主用 (免费 500k tokens/天)
-async function handleGroq(messages, reqId) {
-  const GROQ_API_KEY = process.env.GROQ_API_KEY || globalThis?.GROQ_API_KEY
+async function handleGroq(messages, reqId, env) {
+  const GROQ_API_KEY = env.GROQ_API_KEY
   if (!GROQ_API_KEY) {
     console.error(`[${reqId}] Groq key not configured`)
     primaryServiceHealthy = false
-    return await handleFallback(messages, reqId)
+    return await handleFallback(messages, reqId, env)
   }
 
   try {
@@ -156,7 +156,7 @@ async function handleGroq(messages, reqId) {
     if (response.status === 429) {
       console.warn(`[${reqId}] Groq rate limited`)
       primaryServiceHealthy = false
-      return await handleFallback(messages, reqId)
+      return await handleFallback(messages, reqId, env)
     }
 
     const data = await response.json()
@@ -177,15 +177,13 @@ async function handleGroq(messages, reqId) {
   } catch (error) {
     console.error(`[${reqId}] Groq failed:`, error.message)
     primaryServiceHealthy = false
-    return await handleFallback(messages, reqId)
+    return await handleFallback(messages, reqId, env)
   }
 }
 
 // 备用链路: OpenRouter → CF Workers AI
-async function handleFallback(messages, reqId) {
-  const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY || globalThis?.OPENROUTER_API_KEY
-  const CF_ACCOUNT_ID = process.env.CF_ACCOUNT_ID || globalThis?.CF_ACCOUNT_ID
-  const CF_API_TOKEN = process.env.CF_API_TOKEN || globalThis?.CF_API_TOKEN
+async function handleFallback(messages, reqId, env) {
+  const { OPENROUTER_API_KEY, CF_ACCOUNT_ID, CF_API_TOKEN } = env
 
   // 先试 OpenRouter
   if (OPENROUTER_API_KEY) {
@@ -257,11 +255,12 @@ async function handleFallback(messages, reqId) {
 
 // 健康检查
 async function checkHealth(env) {
-  const GROQ_API_KEY = env.GROQ_API_KEY
+  const { GROQ_API_KEY } = env
 
   if (!GROQ_API_KEY) {
     primaryServiceHealthy = false
     currentState = STATE.DEAD
+    console.log('Health: Groq key missing')
     return
   }
 
