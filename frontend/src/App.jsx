@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react'
 import './App.css'
 
-const API_URL = 'https://neon-flow.pages.dev/api/chat'
+const API_URL = 'https://dwlab.asia/api/chat'
 
 // 流光的人设
 const PERSONA = {

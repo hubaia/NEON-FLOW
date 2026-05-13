@@ -6,8 +6,8 @@
  * 健康检测: 自动切换到备用服务商
  */
 
-const GROQ_API_URL = 'https://api.groq.com/openai/v1/chat/completions'
-const GROQ_MODEL = 'llama-3.3-70b-versatile'
+const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions'
+const OPENROUTER_MODEL = 'meta-llama/llama-3.3-70b-instruct'
 
 // 备用模型 (Cloudflare Workers AI)
 const CF_MODEL = '@cf/meta/llama-3.1-8b-instruct'
@@ -84,7 +84,7 @@ export default {
 
         // 路由选择
         if (primaryServiceHealthy) {
-          return await handleGroq(chatMessages, env)
+          return await handleOpenRouter(chatMessages, env)
         } else {
           return await handleCFWorkers(chatMessages, env)
         }
@@ -109,22 +109,24 @@ export default {
   }
 }
 
-// Groq 处理
-async function handleGroq(messages, env) {
-  if (!env.GROQ_API_KEY) {
+// OpenRouter 处理
+async function handleOpenRouter(messages, env) {
+  if (!env.OPENROUTER_API_KEY) {
     primaryServiceHealthy = false
     return await handleCFWorkers(messages, env)
   }
 
   try {
-    const response = await fetch(GROQ_API_URL, {
+    const response = await fetch(OPENROUTER_API_URL, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${env.GROQ_API_KEY}`,
-        'Content-Type': 'application/json'
+        'Authorization': `Bearer ${env.OPENROUTER_API_KEY}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://dwlab.asia',
+        'X-Title': 'NEON-FLOW'
       },
       body: JSON.stringify({
-        model: GROQ_MODEL,
+        model: OPENROUTER_MODEL,
         messages: messages,
         temperature: 0.7,
         max_tokens: 1024
@@ -133,7 +135,7 @@ async function handleGroq(messages, env) {
 
     if (!response.ok) {
       const error = await response.json()
-      console.error('Groq API Error:', error)
+      console.error('OpenRouter API Error:', error)
       
       if (response.status === 429) {
         // 限速，切换到备用
@@ -141,7 +143,7 @@ async function handleGroq(messages, env) {
         return await handleCFWorkers(messages, env)
       }
       
-      throw new Error(error.error?.message || 'Groq API 请求失败')
+      throw new Error(error.error?.message || 'OpenRouter API 请求失败')
     }
 
     const data = await response.json()
@@ -150,13 +152,13 @@ async function handleGroq(messages, env) {
 
     return new Response(JSON.stringify({
       content: data.choices[0].message.content,
-      model: GROQ_MODEL,
+      model: OPENROUTER_MODEL,
       usage: data.usage
     }), {
       headers: { 'Content-Type': 'application/json' }
     })
   } catch (error) {
-    console.error('Groq Error:', error)
+    console.error('OpenRouter Error:', error)
     primaryServiceHealthy = false
     return await handleCFWorkers(messages, env)
   }
@@ -214,29 +216,31 @@ async function handleCFWorkers(messages, env) {
 // 健康检查
 async function checkHealth(env) {
   try {
-    // 检测 Groq
-    const groqTest = await fetch(GROQ_API_URL, {
+    // 检测 OpenRouter
+    const openRouterTest = await fetch(OPENROUTER_API_URL, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${env.GROQ_API_KEY || ''}`,
-        'Content-Type': 'application/json'
+        'Authorization': `Bearer ${env.OPENROUTER_API_KEY || ''}`,
+        'Content-Type': 'application/json',
+        'HTTP-Referer': 'https://dwlab.asia',
+        'X-Title': 'NEON-FLOW'
       },
       body: JSON.stringify({
-        model: GROQ_MODEL,
+        model: OPENROUTER_MODEL,
         messages: [{ role: 'user', content: 'ping' }],
         max_tokens: 1
       })
     })
 
-    if (groqTest.ok || groqTest.status === 429) {
-      // Groq 可用（429 表示限速，但服务正常）
+    if (openRouterTest.ok || openRouterTest.status === 429) {
+      // OpenRouter 可用（429 表示限速，但服务正常）
       primaryServiceHealthy = true
       currentState = STATE.ALIVE
-      console.log('Health check: Groq OK')
+      console.log('Health check: OpenRouter OK')
     } else {
       primaryServiceHealthy = false
       currentState = STATE.DEGRADED
-      console.log('Health check: Groq Unavailable')
+      console.log('Health check: OpenRouter Unavailable')
     }
   } catch (error) {
     primaryServiceHealthy = false

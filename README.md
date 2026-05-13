@@ -27,7 +27,7 @@
        ▼
 Cloudflare Worker (API 网关)
        │
-       ├── Groq (Llama-3.3-70B) ← 主服务商
+       ├── OpenRouter (Llama-3.3-70B) ← 主服务商
        │
        └── Cloudflare Workers AI ← 备用
 ```
@@ -39,7 +39,7 @@ Cloudflare Worker (API 网关)
 | 前端 | React + Vite |
 | 托管 | GitHub Pages (免费) |
 | 网关 | Cloudflare Workers (免费 10万次/天) |
-| 主模型 | Groq (Llama-3.3-70B, 免费无限) |
+| 主模型 | OpenRouter (Llama-3.3-70B, 免费无限) |
 | 备用模型 | CF Workers AI (免费 10万/天) |
 
 ## 部署
@@ -64,7 +64,7 @@ npx wrangler deploy
 
 在 Cloudflare Dashboard 配置：
 
-- `GROQ_API_KEY`: Groq API 密钥
+- `OPENROUTER_API_KEY`: OpenRouter API 密钥
 - `CF_ACCOUNT_ID`: Cloudflare Account ID
 - `CF_API_TOKEN`: Cloudflare API Token
 
