@@ -1,5 +1,5 @@
 /**
- * NEON-FLOW Worker v4.3
+ * NEON-FLOW Worker v4.4
  * 流光 - 去中心化 AI 助手
  * 
  * 架构: GitHub Pages (前端) → Cloudflare Worker (网关) → 多模型路由
@@ -175,7 +175,7 @@ export default {
     // 根路径
     if (url.pathname === '/' || url.pathname === '') {
       return jsonResponse({
-        name: 'NEON-FLOW', version: '4.3', status: currentState,
+        name: 'NEON-FLOW', version: '4.4', status: currentState,
         primary: primaryServiceHealthy ? 'groq' : 'openrouter',
         endpoints: { chat: '/api/chat', health: '/health', models: '/models', stats: '/stats' }
       })
