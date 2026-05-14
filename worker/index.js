@@ -29,6 +29,23 @@ const OPENROUTER_FREE_MODELS = [
 ]
 
 const CF_MODEL = '@cf/meta/llama-3.1-8b-instruct'
+
+// Google Gemini (备用)
+const GEMINI_API_URL = 'https://generativelanguage.googleapis/v1beta/models'
+const GEMINI_MODELS = [
+  'gemini-2.0-flash',
+  // 'gemini-1.5-flash',
+  // 填写你的免费模型 ID
+]
+const GEMINI_API_KEY = ''  // 在 env.GEMINI_API_KEY 配置
+
+// SiliconFlow (备用)
+const SILICON_API_URL = 'https://api.siliconflow.cn/v1/chat/completions'
+const SILICON_MODELS = [
+  // '填入免费模型 ID',
+]
+const SILICON_API_KEY = ''  // 在 env.SILICON_API_KEY 配置
+
 const REQUEST_TIMEOUT = 15000
 const COOLDOWN_MS = 5 * 60 * 1000 // 5分钟冷却
 const MAX_HISTORY = 20 // 最多保留对话数
@@ -45,14 +62,40 @@ const modelStatus = Object.fromEntries(
   }])
 )
 
+// Google Gemini 模型状态
+const geminiStatus = Object.fromEntries(
+  GEMINI_MODELS.map(m => [m, {
+    healthy: true,
+    lastError: null,
+    cooldownUntil: 0,
+    failCount: 0,
+    successCount: 0
+  }])
+)
+
+// SiliconFlow 模型状态
+const siliconStatus = Object.fromEntries(
+  SILICON_MODELS.map(m => [m, {
+    healthy: true,
+    lastError: null,
+    cooldownUntil: 0,
+    failCount: 0,
+    successCount: 0
+  }])
+)
+
 // 全局统计
 const stats = {
   requests: 0,
   groqRequests: 0,
   orRequests: 0,
+  googleRequests: 0,
+  siliconRequests: 0,
   cfRequests: 0,
   groqSuccess: 0,
   orSuccess: 0,
+  googleSuccess: 0,
+  siliconSuccess: 0,
   cfSuccess: 0,
   startedAt: now()
 }
@@ -208,13 +251,37 @@ export default {
           })),
           availableCount: getAvailableModels().length
         },
-        cf: { provider: 'CF Workers AI', model: CF_MODEL }
+        cf: { provider: 'CF Workers AI', model: CF_MODEL },
+        google: {
+          provider: 'Google Gemini',
+          models: GEMINI_MODELS.map(m => ({
+            id: m,
+            healthy: geminiStatus[m].healthy,
+            cooldown: geminiStatus[m].cooldownUntil > now(),
+            cooldownRemaining: Math.max(0, Math.round((geminiStatus[m].cooldownUntil - now()) / 1000)),
+            failCount: geminiStatus[m].failCount,
+            successCount: geminiStatus[m].successCount,
+            lastError: geminiStatus[m].lastError
+          }))
+        },
+        silicon: {
+          provider: 'SiliconFlow',
+          models: SILICON_MODELS.map(m => ({
+            id: m,
+            healthy: siliconStatus[m].healthy,
+            cooldown: siliconStatus[m].cooldownUntil > now(),
+            cooldownRemaining: Math.max(0, Math.round((siliconStatus[m].cooldownUntil - now()) / 1000)),
+            failCount: siliconStatus[m].failCount,
+            successCount: siliconStatus[m].successCount,
+            lastError: siliconStatus[m].lastError
+          }))
+        }
       })
     }
 
     // 统计
     if (url.pathname === '/stats') {
-      const total = stats.orSuccess + stats.cfSuccess
+      const total = stats.orSuccess + stats.googleSuccess + stats.siliconSuccess + stats.cfSuccess
       const orRate = total > 0 ? ((stats.orSuccess / total) * 100).toFixed(1) : '0'
       const cfRate = total > 0 ? ((stats.cfSuccess / total) * 100).toFixed(1) : '0'
       return jsonResponse({
@@ -500,7 +567,133 @@ async function handleOpenRouterFallback(messages, reqId, env) {
     }
   }
 
+  // 2. 尝试 Google Gemini
+  const { GEMINI_API_KEY } = env
+  if (GEMINI_API_KEY) {
+    const geminiResult = await handleGoogleGemini(messages, reqId, GEMINI_API_KEY)
+    if (geminiResult) return geminiResult
+  }
+
+  // 3. 尝试 SiliconFlow
+  const { SILICON_API_KEY } = env
+  if (SILICON_API_KEY) {
+    const siliconResult = await handleSiliconFlow(messages, reqId, SILICON_API_KEY)
+    if (siliconResult) return siliconResult
+  }
+
+  // 4. 最后尝试 CF Workers AI
   return await handleCFFallback(messages, reqId, CF_ACCOUNT_ID, CF_API_TOKEN)
+}
+
+// Google Gemini
+async function handleGoogleGemini(messages, reqId, apiKey) {
+  if (!apiKey || !GEMINI_MODELS.length) return null
+
+  for (const model of GEMINI_MODELS) {
+    const status = geminiStatus[model]
+    stats.googleRequests++
+
+    try {
+      const response = await fetchWithTimeout(
+        `${GEMINI_API_URL}/${model}:generateContent?key=${apiKey}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: messages.map(m => ({ role: m.role === 'user' ? 'user' : 'model', parts: [{ text: m.content }] })),
+            generationConfig: { maxOutputTokens: 1024, temperature: 0.7 }
+          })
+        }
+      )
+
+      if (response.status === 429 || response.status === 503) {
+        status.healthy = false
+        status.cooldownUntil = now() + COOLDOWN_MS
+        stats.googleRequests--
+        continue
+      }
+
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error?.message || `HTTP ${response.status}`)
+
+      status.healthy = true
+      status.lastError = null
+      currentState = STATE.DEGRADED
+      stats.googleSuccess++
+
+      return new Response(JSON.stringify({
+        content: data.candidates?.[0]?.content?.parts?.[0]?.text || '',
+        model: `gemini/${model}`,
+        fallback: true,
+        requestId: reqId
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      })
+    } catch (error) {
+      status.healthy = false
+      status.cooldownUntil = now() + COOLDOWN_MS
+      status.lastError = error.message
+      status.failCount++
+      stats.googleRequests--
+    }
+  }
+
+  return null  // 所有 Google 模型都失败
+}
+
+// SiliconFlow
+async function handleSiliconFlow(messages, reqId, apiKey) {
+  if (!apiKey || !SILICON_MODELS.length) return null
+
+  for (const model of SILICON_MODELS) {
+    const status = siliconStatus[model]
+    stats.siliconRequests++
+
+    try {
+      const response = await fetchWithTimeout(SILICON_API_URL, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ model, messages, temperature: 0.7, max_tokens: 1024 })
+      })
+
+      if (response.status === 429 || response.status === 503) {
+        status.healthy = false
+        status.cooldownUntil = now() + COOLDOWN_MS
+        stats.siliconRequests--
+        continue
+      }
+
+      const data = await response.json()
+      if (!response.ok) throw new Error(data.error?.message || `HTTP ${response.status}`)
+
+      status.healthy = true
+      status.lastError = null
+      currentState = STATE.DEGRADED
+      stats.siliconSuccess++
+
+      return new Response(JSON.stringify({
+        content: data.choices?.[0]?.message?.content || '',
+        model: `silicon/${model}`,
+        fallback: true,
+        requestId: reqId
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' }
+      })
+    } catch (error) {
+      status.healthy = false
+      status.cooldownUntil = now() + COOLDOWN_MS
+      status.lastError = error.message
+      status.failCount++
+      stats.siliconRequests--
+    }
+  }
+
+  return null
 }
 
 // CF Workers AI
