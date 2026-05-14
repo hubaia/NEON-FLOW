@@ -1,0 +1,11 @@
+# Cloudflare API Configuration
+# 复制此文件为 config.env 并填入你的值
+
+# API Token (Dashboard → Profile → API Tokens → Create Custom Token)
+CF_API_TOKEN=
+
+# Account ID (Dashboard → 任意域名的 Overview 底部)
+CF_ACCOUNT_ID=
+
+# 默认 Zone ID (如果只有一个域名可以写死在这里)
+# CF_ZONE_ID=
