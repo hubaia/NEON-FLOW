@@ -18,3 +18,16 @@ STATE = "alive"
 # 触发器：每5分钟执行健康检查
 [triggers]
 crons = ["*/5 * * * *"]
+
+# Workflows 配置
+[[workflows]]
+name = "neon-flow-reply"
+entrypoint = "NeonFlowReplyWorkflow"
+# HTTP 触发路由（Worker 外部可通过 HTTP 调用）
+routing = { type = "http" }
+
+# Workflow KV binding（Workflow 状态持久化）
+# 命名空间 ID 与 CHAT_HISTORY 相同或新建一个
+[[kv_namespaces]]
+binding = "WORKFLOW_KV"
+id = "e9fc4e8805764cb088e58da920a51f0b"

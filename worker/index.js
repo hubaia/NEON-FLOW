@@ -322,6 +322,48 @@ export default {
       return jsonResponse({ error: 'KV not configured' }, 500)
     }
 
+    // Workflow 触发接口
+    if (url.pathname === '/api/workflow/reply' && request.method === 'POST') {
+      try {
+        const body = await request.json()
+        const { messages, sessionId, userId } = body
+
+        if (!messages || !Array.isArray(messages)) {
+          return jsonResponse({ error: 'messages 必须是数组' }, 400)
+        }
+
+        // 通过 Workflow API 触发
+        const instance = await env.NEON_FLOW_REPLY.create({
+          params: { messages, sessionId, userId }
+        })
+
+        return jsonResponse({
+          ok: true,
+          instanceId: instance.id,
+          status: instance.status,
+          message: 'Workflow 已触发，请通过 GET /api/workflow/status/{instanceId} 查询结果'
+        })
+      } catch (error) {
+        return jsonResponse({ error: error.message }, 500)
+      }
+    }
+
+    // Workflow 状态查询
+    if (url.pathname.startsWith('/api/workflow/status/') && request.method === 'GET') {
+      const instanceId = url.pathname.split('/').pop()
+      try {
+        const instance = await env.NEON_FLOW_REPLY.fetch(instanceId)
+        return jsonResponse({
+          id: instance.id,
+          status: instance.status,
+          output: instance.output,
+          error: instance.error,
+        })
+      } catch (error) {
+        return jsonResponse({ error: error.message }, 500)
+      }
+    }
+
     return jsonResponse({ error: 'Not Found' }, 404)
   },
 
