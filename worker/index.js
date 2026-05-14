@@ -3,7 +3,7 @@
  * 流光 - 去中心化 AI 助手
  * 
  * 架构: GitHub Pages (前端) → Cloudflare Worker (网关) → 多模型路由
- * 路由: Groq(主) → OpenRouter免费模型(备用) → CF Workers AI(最后备用)
+ * 路由: OpenRouter免费模型(主) → Groq(备用) → CF Workers AI(最后备用)
  * 
  * OpenRouter免费模型池 (按优先级):
  * 1. qwen/qwen3-next-80b-a3b-instruct:free  (Qwen最强开源, 80B)
@@ -77,7 +77,7 @@ function buildPersona() {
 const STATE = { ALIVE: 'alive', DEGRADED: 'degraded', DEAD: 'dead' }
 
 let currentState = STATE.ALIVE
-let primaryServiceHealthy = true
+let primaryServiceHealthy = false  // 默认 OpenRouter
 
 function genReqId() {
   return `neon-${now()}-${Math.random().toString(36).slice(2, 6)}`
@@ -176,7 +176,7 @@ export default {
     if (url.pathname === '/' || url.pathname === '') {
       return jsonResponse({
         name: 'NEON-FLOW', version: '4.4', status: currentState,
-        primary: primaryServiceHealthy ? 'groq' : 'openrouter',
+        primary: primaryServiceHealthy ? 'groq' : 'openrouter (free)',
         endpoints: { chat: '/api/chat', health: '/health', models: '/models', stats: '/stats' }
       })
     }
@@ -185,7 +185,7 @@ export default {
     if (url.pathname === '/health') {
       return jsonResponse({
         status: currentState,
-        primary: primaryServiceHealthy ? 'groq' : 'openrouter',
+        primary: primaryServiceHealthy ? 'groq' : 'openrouter (free)',
         uptimeSeconds: Math.round((now() - stats.startedAt) / 1000),
         timestamp: now()
       })
@@ -259,7 +259,7 @@ export default {
         ...messages
       ]
 
-      // 获取回复
+      // 获取回复：primaryServiceHealthy=true 用 Groq，false 用 OpenRouter
       let result
       if (primaryServiceHealthy) {
         result = await handleGroq(fullMessages, reqId, env)
@@ -403,7 +403,7 @@ async function handleGroq(messages, reqId, env) {
     if (!response.ok) throw new Error(data.error?.message || `HTTP ${response.status}`)
 
     currentState = STATE.ALIVE
-    primaryServiceHealthy = true
+    primaryServiceHealthy = true  // Groq 可用时优先用 Groq
     stats.groqSuccess++
 
     return new Response(JSON.stringify({
@@ -558,17 +558,20 @@ async function checkHealth(env) {
       }, 10000)
 
       if (response.ok || response.status === 429) {
-        primaryServiceHealthy = true
-        currentState = STATE.ALIVE
-        console.log(`[${ts()}] Health: Groq OK`)
-        return
+        groqServiceHealthy = true
+        // Groq 恢复时，不立即切回，等 OpenRouter 真正挂了再切
+        console.log(`[${ts()}] Health: Groq OK (备用恢复)`)
+        // 不 return，继续检查 OpenRouter 状态
+      } else {
+        groqServiceHealthy = false
       }
     } catch (error) {
       console.warn(`[${ts()}] Health: Groq error:`, error.message)
+      groqServiceHealthy = false
     }
   }
 
-  primaryServiceHealthy = false
+  // 无论 Groq 状态如何，OpenRouter 免费模型是主用
   const { OPENROUTER_API_KEY } = env
 
   for (const model of getAvailableModels(true)) {
@@ -585,7 +588,8 @@ async function checkHealth(env) {
       }, 10000)
 
       if (response.ok || response.status === 429) {
-        currentState = STATE.DEGRADED
+        primaryServiceHealthy = false  // 保持 OpenRouter 为主
+        currentState = STATE.ALIVE
         console.log(`[${ts()}] Health: OpenRouter OK (${model.split('/')[1]})`)
         return
       }
